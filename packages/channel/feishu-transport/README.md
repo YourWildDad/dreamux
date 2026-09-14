@@ -1,21 +1,21 @@
 # @excitedjs/feishu-transport
 
-Shared **Feishu platform-I/O core** for the dreamux + claudemux channel layers.
-The single place that imports the Feishu SDK.
+The **Feishu platform-I/O core** for the dreamux channel layer. The single
+place that imports the Feishu SDK.
 
 ## Scope
 
-- **transport** — connect / receive / send / `addReaction` / `editText` /
+- **transport** — connect / receive / send / `addReaction` /
   chain-of-thought message I/O / `getChatMode` / `fetchDocComment` /
   `fetchDocMeta` / bot open_id resolution / auth via the
-  `@larksuiteoapi/node-sdk` SDK.
-- **render** — markdown → Feishu v2 card (including inline `<@open_id>` parsing
-  for @-mentions embedded in message text).
-- **parse** — Feishu message content → forwardable text, including:
-  - inbound text / post / interactive / image / file events
+  `@larksuiteoapi/node-sdk` SDK, plus the serialized message-`content`
+  encoding and its size budget.
+- **parse** — Feishu message content → one text body, including:
+  - inbound text / post / interactive / image / file / audio / media events
   - `doc.comment` reply events → normalized comment shape
   - bot member-added events → normalized added-event shape
-  - `Mention` parsing and mention-placeholder replacement in raw message text
+  - mentions left as the `@_user_N` placeholders the message's `mentions`
+    records name, whichever form the sender used
 
 ## WebSocket lifecycle
 
@@ -33,26 +33,39 @@ parameters (Feishu `chat_id`, `message_id`, `file_key`, …) and return
 platform-native results with the minimum of re-shaping required to make
 success/error handling uniform.
 
-## Parse / render helpers
+## Parse helpers
 
-Two pure utility boundaries sit above the SDK layer, with no host dependency:
+One pure utility boundary sits above the SDK layer, with no host dependency:
 
-- **`parse/`** — decode Feishu JSON into forwardable strings and metadata.
-  Use `parseInbound` for messages, `toChannelInbound` to project into the
-  channel-agnostic envelope shape, `applyMentions` + `mentionName` to rewrite
-  `@_user_N` placeholders to `@name` text, and `extractPostText` to flatten a
-  Feishu post (`post` / `zh_cn` / `title` + `content` grid) to plain text.
+- **`parse/`** — decode Feishu JSON into one text body plus metadata. Use
+  `parseInbound` for messages and `narrowMetaFromEvent` for the event
+  envelope. The body is written in Feishu's own vocabulary: a mention stands
+  as the placeholder its record names — a `@_user_N` in text, a structured
+  `at` node, or an `<at>` tag inside native post or card Markdown all become
+  that placeholder — and an image or file stands as its resource key, with the
+  resources listed beside the text. Resolving a placeholder to a person, and a
+  key to a download, is the caller's job. A card is read from the event alone,
+  as the `content`/`text` strings under its display keys and its image and
+  file components; a control's callback payload is never walked.
   `normalizeCommentEvent` / `normalizeBotMemberAddedEvent` do the same for
   comment and bot-added inbound events.
-- **`render/`** — turn a markdown string into a Feishu v2 interactive-card
-  payload, split by byte size to respect the
-  `FEISHU_CARD_REQUEST_LIMIT_BYTES` ceiling. `renderMarkdownToCards` returns
-  one or more `RenderedCard` blocks; `cardToContent` + `cardContentBytes`
-  produce the JSON payload the SDK's `im.v1.message.create` endpoint expects.
+
+## Outgoing message content
+
+`transport.send` serializes the authored body as one v2 interactive card
+holding a single `markdown` element — `{"schema":"2.0","config":
+{"update_multi":true},"body":{"elements":[{"tag":"markdown","content":"…"}]}}`
+— sent as an `interactive` message. The body goes in as written, an
+authored `<at user_id="…">Name</at>` mention included; nothing is rewritten.
+A body whose serialized `content` would exceed the platform content budget is
+split into several ordered cards along block seams; raw cards passed to
+`sendCard` / `editCard` are measured against the same budget. That budget is
+the package's own — no caller chooses it, so it is not part of the exported
+surface.
 
 ## Events
 
-The normalized inbound events produced by `parse/` are platform-specific but
+The normalized inbound bodies produced by `parse/` are platform-specific but
 host-agnostic. Each host is responsible for:
 
 - routing a normalized inbound into its engine / dispatcher turn model,
@@ -63,8 +76,7 @@ host-agnostic. Each host is responsible for:
 ## Engineering rules this package honors
 
 - Ships compiled `dist/` (`tsc`), **no `tsx` runtime dependency**.
-- Consumed as a **published, version-pinned package** by both repos; the two
-  hosts never depend on each other.
+- Consumed as a **published, version-pinned package**.
 - Built via rush in topological order (`rush build` builds this before any
   dependent).
 - No synchronous blocking IO in package source. All fs/process APIs use the

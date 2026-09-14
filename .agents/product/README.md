@@ -36,6 +36,40 @@ the same change that touches it.
   needing no orphan governance; a later message on that conversation simply
   creates or selects another Team. Dissolving a Team cancels all bindings that
   point at it.
+- **Replies are Markdown cards.** The agent writes Markdown and inline
+  `<at user_id="ou_example">Example</at>` directly in the `reply` body; there is
+  no separate mention-list argument. The body is sent as one interactive card
+  holding a single Markdown element, because a card shows text in the client's
+  compact size where a native post shows it larger and thins the information
+  out. A leading heading is no longer lifted into a card title and a table is
+  no longer a native table element; the Markdown goes into the card as
+  written, the mention tag included, and the card renders that tag as a
+  mention (verified in a direct chat), so the model reads and writes one
+  syntax. A supplied `message_id`
+  addresses the original conversation. One body is one card when its
+  serialized content fits 28 KiB; larger bodies split in order, preserving
+  Unicode clusters, code fences, and table headers. An indivisible oversized
+  table row produces a size error. Explicit interactive cards and COT remain
+  available. Platform send failures expose the operation, available HTTP
+  status, Feishu code, reason, and log ID in logs and the MCP failure without
+  copying request data.
+  (Task: [read-feishu-inbound-as-text](/.agents/tasks/channel/read-feishu-inbound-as-text/README.md),
+  superseding the native-post presentation of
+  [simplify-feishu-replies](/.agents/tasks/channel/simplify-feishu-replies/README.md).)
+- **Inbound messages read as one text body.** Text, rich posts, cards, and
+  attachments reach the model as one `<content>` body whose mentions are
+  written exactly as the `reply` tool takes them, `<at user_id="...">Name</at>`,
+  so what the model reads is what it writes back. Only a mention the platform's
+  own mention records name is substituted; text that merely looks like one
+  stays literal. A rich post is read from its native `content_v2` projection.
+  A card contributes its visible text and its images and files, read from the
+  event alone, plus a `<refs>` row naming the message as a rich card the model
+  can pull in full with lark-cli; layout, controls, and link targets are not
+  reconstructed. Images and files anywhere in a message are downloaded, cached,
+  and budgeted the same way and rendered as `<attachment>` where they stood.
+  Changing outgoing replies does not change the raw-event mention gate for
+  peer-bot admission.
+  (Task: [read-feishu-inbound-as-text](/.agents/tasks/channel/read-feishu-inbound-as-text/README.md).)
 - **A question the agent cannot answer becomes a card, and the turn ends.**
   When an agent is blocked on a decision only the user can make, the built-in
   Feishu channel posts an interactive question card — 1-4 single-select
@@ -91,7 +125,12 @@ the same change that touches it.
 - **A collaboration space is a Channel product flow.** The Channel provisions a
   Team via ordinary `team.create` for a chat or topic it manages; provisioning
   progress is volatile, and a crash may leave an accepted orphan Team rather
-  than a persisted saga.
+  than a persisted saga. A newly provisioned Feishu topic Team receives its
+  configured identity followed by the bound chat and initial triggering message
+  address. The leader must use that initial message ID when its current context
+  offers no other one, and must never omit the reply message ID. Existing Teams
+  and the shared space policy are unchanged; identity stays a string.
+  (Task: [simplify-feishu-replies](/.agents/tasks/channel/simplify-feishu-replies/README.md).)
 - **Binding changes are confirmed with a card, and the card names real paths.**
   When a chat, topic, or space binding changes, the built-in Feishu channel
   posts a confirmation card: space-bound shows the space name, TeamLeader

@@ -1,10 +1,7 @@
 import type { Mention } from '../contract/types.js'
 
-export type FeishuMessageReadMode = 'default' | 'user_card_content'
-
 export interface FeishuMessageReadRequest {
   messageId: string
-  cardContent?: FeishuMessageReadMode
 }
 
 /** Projection of one `im.v1.message.get` item: its content, and where it is. */
@@ -78,7 +75,11 @@ function normalizeMessageReadMention(
       ? { union_id: id }
       : raw.id_type === 'user_id'
         ? { user_id: id }
-        : { open_id: id }
+        // An application id is not a user identity and nothing can reply to
+        // one, so the record keeps its key and name and claims no identity.
+        : raw.id_type === 'app_id'
+          ? undefined
+          : { open_id: id }
   return {
     key: raw.key ?? '',
     ...(identity !== undefined ? { id: identity } : {}),

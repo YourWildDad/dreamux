@@ -2,13 +2,11 @@ import * as lark from '@larksuiteoapi/node-sdk'
 import type { Readable } from 'node:stream'
 
 import type { OutboundTarget } from '../contract/outbound.js'
-import { sendInteractiveCard } from './outbound-card.js'
+import { sendFeishuMessage } from './outbound-message.js'
 import {
-  cardToContent,
-  renderMarkdownToCards,
-  FEISHU_CARD_REQUEST_LIMIT_BYTES,
-  type RenderedCard,
-} from '../render/render.js'
+  assertMessageContentFits,
+  cardContents,
+} from './message-content.js'
 import {
   connectionErrorLogLine,
   reconnectedLogLine,
@@ -40,7 +38,6 @@ export {
 } from './identity.js'
 export type {
   FeishuMessageReadItem,
-  FeishuMessageReadMode,
   FeishuMessageReadRequest,
   FeishuMessageReadResponse,
   FeishuMessageReader,
@@ -64,7 +61,7 @@ export interface FeishuSendOptions {
     signal?: AbortSignal
     /**
      * Synchronous receipt for each message the platform confirms creating.
-     * It fires before the next rendered card is sent, preserving partial-send
+     * It fires before the next part is sent, preserving partial-send
      * ordering for callers that need platform-visible facts as they happen.
      * Observer failures are non-authoritative and never affect message sends.
      * Text `send` consumes this field; `sendCard` accepts only `signal`.
@@ -103,34 +100,6 @@ export interface FeishuInviteMembersResult {
 }
 
 export type FeishuChatMode = 'p2p' | 'group' | 'topic'
-
-export function textMessageContent(text: string): string {
-  return JSON.stringify({ text })
-}
-
-export const FEISHU_CARD_CONTENT_SAFE_BYTES = 28 * 1024
-
-function assertCardContentFits(content: string): void {
-  const bytes = Buffer.byteLength(content, 'utf8')
-  if (bytes > FEISHU_CARD_CONTENT_SAFE_BYTES) {
-    throw new Error(
-      `card content is ${bytes} bytes; Feishu rejects a card-message body over ${FEISHU_CARD_REQUEST_LIMIT_BYTES} bytes. ` +
-        'Shorten the message, or break up an oversized table or code block the renderer could not split smaller.',
-    )
-  }
-}
-
-function renderSingleCard(text: string): RenderedCard {
-  const cards = renderMarkdownToCards(text)
-  if (cards.length !== 1) {
-    throw new Error(
-      `edit body produced ${cards.length} cards, but an edit can only update one ` +
-        'card in place. Reduce the body length, drop oversized tables, or send a ' +
-        'fresh reply (which the channel splits automatically) instead of editing.',
-    )
-  }
-  return cards[0] as RenderedCard
-}
 
 function feishuChatClient(client: lark.Client): {
   chat?: {
@@ -292,7 +261,6 @@ export interface FeishuTransport {
     /** Optional best-effort lookup of a chat's current Feishu name. */
     resolveChatName?(chatId: string): Promise<string | undefined>
     addReaction(messageId: string, emoji: string): Promise<string>
-    editText(messageId: string, text: string): Promise<void>
     /** Repaint an already-sent card in place, by message id. */
     editCard(messageId: string, card: unknown): Promise<void>
     fetchDocComment(fileToken: string, fileType: string, commentId: string): Promise<FeishuDocComment | null>
@@ -429,12 +397,9 @@ export function createFeishuTransport(
       text: string,
       options?: Pick<FeishuSendOptions, 'onMessageCreated'>,
     ): Promise<FeishuSendResult> {
-      const cards = renderMarkdownToCards(textWithLeadingMentions(target, text))
       const messageIds: string[] = []
-      for (const card of cards) {
-        const content = cardToContent(card)
-        assertCardContentFits(content)
-        const res = await sendInteractiveCard(client, target, content)
+      for (const content of cardContents(text)) {
+        const res = await sendFeishuMessage(client, target, content)
         const id = res.data?.message_id
         if (id) {
           const ordinal = messageIds.length
@@ -451,13 +416,8 @@ export function createFeishuTransport(
       options?: Pick<FeishuSendOptions, 'signal'>,
     ): Promise<FeishuSendResult> {
       const content = JSON.stringify(card)
-      assertCardContentFits(content)
-      const res = await sendInteractiveCard(
-        client,
-        target,
-        content,
-        options?.signal,
-      )
+      assertMessageContentFits(content)
+      const res = await sendFeishuMessage(client, target, content, options?.signal)
       const id = res.data?.message_id
       return { messageIds: id ? [id] : [] }
     },
@@ -527,32 +487,11 @@ export function createFeishuTransport(
 
     async editCard(messageId: string, card: unknown): Promise<void> {
       const cardContent = JSON.stringify(card)
-      assertCardContentFits(cardContent)
+      assertMessageContentFits(cardContent)
       await client.im.message.patch({
         path: { message_id: messageId },
         data: { content: cardContent },
       })
-    },
-
-    async editText(messageId: string, text: string): Promise<void> {
-      const card = renderSingleCard(text)
-      const cardContent = cardToContent(card)
-      assertCardContentFits(cardContent)
-      try {
-        await client.im.message.patch({
-          path: { message_id: messageId },
-          data: { content: cardContent },
-        })
-      } catch (patchErr) {
-        try {
-          await client.im.message.update({
-            path: { message_id: messageId },
-            data: { msg_type: 'text', content: textMessageContent(text) },
-          })
-        } catch {
-          throw patchErr
-        }
-      }
     },
 
     async fetchDocComment(
@@ -612,12 +551,6 @@ export function createFeishuTransport(
     ): Promise<FeishuMessageReadResponse> {
       const res = await client.im.v1.message.get({
         path: { message_id: request.messageId },
-        params: {
-          user_id_type: 'open_id',
-          ...(request.cardContent === 'user_card_content'
-            ? { card_msg_content_type: 'user_card_content' }
-            : {}),
-        },
       })
       return {
         items: (res.data?.items ?? []).map(normalizeMessageReadItem),
@@ -647,12 +580,6 @@ export function createFeishuTransport(
       wsClient = undefined
     },
   }
-}
-
-function textWithLeadingMentions(target: OutboundTarget, text: string): string {
-  const mentions = target.mentionUserIds ?? []
-  if (mentions.length === 0) return text
-  return `${mentions.map((id) => `<@${id}>`).join(' ')}\n${text}`
 }
 
 function raceConnectionReady(ready: Promise<void>): Promise<boolean> {
