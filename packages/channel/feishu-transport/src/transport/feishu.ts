@@ -143,21 +143,61 @@ async function fetchUserName(client: lark.Client, openId: string):
   return typeof name === 'string' && name !== '' ? name : undefined
 }
 
-export interface FeishuDocCommentReply {
-    replyId: string
-    authorId: string
-    elements: unknown[]
+/**
+ * What a metadata read actually established.
+ *
+ * A caller uses this read as a permission proof, and the three answers it used
+ * to collapse into `null` are not one fact: a token Feishu reports in
+ * `failed_list` proves this app cannot see the document, a type the metadata
+ * API does not take proves only that, and a request that failed proves nothing
+ * at all — so it is not an answer here, it is a rejected promise.
+ */
+export type FeishuDocMetaResult =
+  | { readonly kind: 'visible' }
+  | { readonly kind: 'invisible' }
+  | { readonly kind: 'unsupported_type' }
+
+/** The document a wiki node points at. */
+export interface FeishuWikiNode {
+    objToken: string
+    objType: string
 }
 
-export interface FeishuDocComment {
-    isWhole: boolean
+/**
+ * One piece of a comment's body.
+ *
+ * A mention stays a mention rather than being flattened into text here,
+ * because the element a model reads it as is an agent-facing body format and
+ * this package does not assemble those. The caller decides how to write it.
+ */
+export type FeishuCommentSegment =
+    | { readonly kind: 'text'; readonly text: string }
+    | { readonly kind: 'mention'; readonly openId: string }
+
+/**
+ * The one comment a `drive.notice.comment_add_v1` event names.
+ *
+ * The event payload carries identifying ids only, so a caller that wants to
+ * show a person what was written has to read the thread. Only the named item
+ * is returned: a whole thread is what lark-cli is for.
+ */
+export interface FeishuDocCommentText {
+    /**
+     * The document text the comment is anchored to, empty for a comment on the
+     * whole document. It is what says which part of the document is discussed.
+     */
     quote: string
-    replies: FeishuDocCommentReply[]
+    /** What the commenter wrote, in order. */
+    segments: readonly FeishuCommentSegment[]
 }
 
-export interface FeishuDocMeta {
-    title: string
-    url: string
+/** The one comment to read: a thread, and the item inside it. */
+export interface FeishuDocCommentRequest {
+    fileToken: string
+    fileType: string
+    commentId: string
+    /** Empty names the thread's own top-level comment. */
+    replyId: string
 }
 
 export type FeishuMessageResourceType = 'file' | 'image'
@@ -179,42 +219,6 @@ export interface FeishuMessageResourceFetcher {
   ): Promise<FeishuMessageResourceResponse>
 }
 
-const COMMENT_FILE_TYPES = ['doc', 'docx', 'sheet', 'file'] as const
-type CommentFileType = (typeof COMMENT_FILE_TYPES)[number]
-
-function asCommentFileType(fileType: string): CommentFileType | undefined {
-  return (COMMENT_FILE_TYPES as readonly string[]).includes(fileType)
-    ? (fileType as CommentFileType)
-    : undefined
-}
-
-interface RawCommentItem {
-  comment_id?: string
-  is_whole?: boolean
-  quote?: string
-  reply_list?: {
-    replies?: Array<{
-      reply_id?: string
-      user_id?: string
-      content?: { elements?: unknown[] }
-    }>
-  }
-}
-
-export function commentFromBatchQuery(
-  items: RawCommentItem[],
-  commentId: string,
-): FeishuDocComment | null {
-  const item = items.find((c) => c.comment_id === commentId)
-  if (!item) return null
-  const replies: FeishuDocCommentReply[] = (item.reply_list?.replies ?? []).map((reply) => ({
-    replyId: reply.reply_id ?? '',
-    authorId: reply.user_id ?? '',
-    elements: reply.content?.elements ?? [],
-  }))
-  return { isWhole: item.is_whole ?? true, quote: item.quote ?? '', replies }
-}
-
 const META_DOC_TYPES = [
   'doc',
   'docx',
@@ -233,6 +237,50 @@ function asMetaDocType(fileType: string): MetaDocType | undefined {
   return (META_DOC_TYPES as readonly string[]).includes(fileType)
     ? (fileType as MetaDocType)
     : undefined
+}
+
+/**
+ * The document types the comment API takes, intersected with the types a
+ * comment event can name. It is narrower than the metadata API's list, so the
+ * two conversions cannot share one.
+ */
+const COMMENT_FILE_TYPES = ['doc', 'docx', 'sheet', 'bitable', 'slides', 'file'] as const
+type CommentFileType = (typeof COMMENT_FILE_TYPES)[number]
+
+function asCommentFileType(fileType: string): CommentFileType | undefined {
+  return (COMMENT_FILE_TYPES as readonly string[]).includes(fileType)
+    ? (fileType as CommentFileType)
+    : undefined
+}
+
+interface RawCommentElement {
+  type: 'text_run' | 'docs_link' | 'person'
+  text_run?: { text: string }
+  docs_link?: { url: string }
+  person?: { user_id: string }
+}
+
+/**
+ * One comment's elements, in order, as the two kinds of thing they can be.
+ *
+ * A `docs_link` is text: it is a URL the commenter typed and reads as one. A
+ * `person` is not, because the caller writes it as the same mention element an
+ * inbound chat message's mention becomes, and only the caller owns that form.
+ *
+ * Each element's payload is optional in Feishu's own types even when `type`
+ * names it, so an element that carries nothing contributes nothing.
+ */
+function commentElementSegment(element: RawCommentElement): FeishuCommentSegment {
+  switch (element.type) {
+    case 'text_run':
+      return { kind: 'text', text: element.text_run?.text ?? '' }
+    case 'docs_link':
+      return { kind: 'text', text: element.docs_link?.url ?? '' }
+    case 'person':
+      return element.person === undefined
+        ? { kind: 'text', text: '' }
+        : { kind: 'mention', openId: element.person.user_id }
+  }
 }
 
 export type RouteHandler = (raw: unknown) => Promise<unknown>
@@ -263,8 +311,20 @@ export interface FeishuTransport {
     addReaction(messageId: string, emoji: string): Promise<string>
     /** Repaint an already-sent card in place, by message id. */
     editCard(messageId: string, card: unknown): Promise<void>
-    fetchDocComment(fileToken: string, fileType: string, commentId: string): Promise<FeishuDocComment | null>
-    fetchDocMeta(fileToken: string, fileType: string): Promise<FeishuDocMeta | null>
+    fetchDocMeta(fileToken: string, fileType: string): Promise<FeishuDocMetaResult>
+    /**
+     * The text of the one comment a request names, or `null` when the thread
+     * Feishu returns does not hold it. Every `null` means the same thing to a
+     * caller — there is no text to show — so it is one value and not a
+     * discriminated result.
+     */
+    fetchDocCommentText(request: FeishuDocCommentRequest): Promise<FeishuDocCommentText | null>
+    /**
+     * The document a wiki node holds, or `null` when this app cannot see that
+     * node. A wiki URL names the node, while every comment API — and the
+     * comment event itself — names the object inside it.
+     */
+    resolveWikiNode(token: string): Promise<FeishuWikiNode | null>
     fetchMessageResource(request: FeishuMessageResourceRequest): Promise<FeishuMessageResourceResponse>
     readMessage?(request: FeishuMessageReadRequest): Promise<FeishuMessageReadResponse>
     /** Optional best-effort contact lookup for an accepted human sender. */
@@ -494,40 +554,76 @@ export function createFeishuTransport(
       })
     },
 
-    async fetchDocComment(
+    async fetchDocMeta(
       fileToken: string,
       fileType: string,
-      commentId: string,
-    ): Promise<FeishuDocComment | null> {
-      const ct = asCommentFileType(fileType)
+    ): Promise<FeishuDocMetaResult> {
+      const dt = asMetaDocType(fileType)
+      if (!dt) return { kind: 'unsupported_type' }
+      const res = await client.drive.meta.batchQuery({
+        data: { request_docs: [{ doc_token: fileToken, doc_type: dt }] },
+      })
+      if (res.data?.metas?.some((row) => row.doc_token === fileToken)) {
+        return { kind: 'visible' }
+      }
+      if (res.data?.failed_list?.some((row) => row.token === fileToken)) {
+        return { kind: 'invisible' }
+      }
+      // Neither list claims the token, so nothing here was established. Saying
+      // "invisible" would send an operator to fix permissions that are fine.
+      throw new Error(
+        `Feishu returned no metadata verdict for ${fileToken} ` +
+          `(code ${res.code ?? 'none'}: ${res.msg ?? ''})`,
+      )
+    },
+
+    async fetchDocCommentText(
+      request: FeishuDocCommentRequest,
+    ): Promise<FeishuDocCommentText | null> {
+      const ct = asCommentFileType(request.fileType)
       if (!ct) return null
-      try {
-        const res = await client.drive.fileComment.batchQuery({
-          path: { file_token: fileToken },
-          params: { file_type: ct, user_id_type: 'open_id' },
-          data: { comment_ids: [commentId] },
-        })
-        return commentFromBatchQuery(res.data?.items ?? [], commentId)
-      } catch (err) {
-        diag.diagnostic(`could not fetch comment ${commentId} on ${fileToken}:`, err)
-        return null
+      const res = await client.drive.fileComment.batchQuery({
+        path: { file_token: request.fileToken },
+        params: { file_type: ct, user_id_type: 'open_id' },
+        data: { comment_ids: [request.commentId] },
+      })
+      // A non-zero business code arrives on a successful HTTP response, so a
+      // revoked scope would otherwise read as "this thread holds no such item".
+      if (res.code !== undefined && res.code !== 0) {
+        throw new Error(
+          `Feishu comment read for ${request.commentId} failed ` +
+            `(code ${res.code}: ${res.msg ?? ''})`,
+        )
+      }
+      const item = res.data?.items?.find((row) => row.comment_id === request.commentId)
+      if (!item) return null
+      // An empty reply id names the thread's own comment, which the API
+      // carries as the first entry of the same `reply_list` its replies are in.
+      const replies = item.reply_list?.replies ?? []
+      const reply = request.replyId === ''
+        ? replies[0]
+        : replies.find((row) => row.reply_id === request.replyId)
+      if (!reply) return null
+      return {
+        quote: item.quote ?? '',
+        segments: reply.content.elements.map(commentElementSegment),
       }
     },
 
-    async fetchDocMeta(fileToken: string, fileType: string): Promise<FeishuDocMeta | null> {
-      const dt = asMetaDocType(fileType)
-      if (!dt) return null
-      try {
-        const res = await client.drive.meta.batchQuery({
-          data: { request_docs: [{ doc_token: fileToken, doc_type: dt }], with_url: true },
-        })
-        const meta = res.data?.metas?.[0]
-        if (!meta) return null
-        return { title: meta.title ?? '', url: meta.url ?? '' }
-      } catch (err) {
-        diag.diagnostic(`could not fetch metadata for ${fileToken}:`, err)
-        return null
+    async resolveWikiNode(token: string): Promise<FeishuWikiNode | null> {
+      const res = await client.wiki.v2.space.getNode({ params: { token } })
+      // A non-zero business code arrives on a successful HTTP response, so it
+      // has to be read here: rate limiting or a revoked scope is not this app
+      // failing to see the node, and must not be reported as one.
+      if (res.code !== undefined && res.code !== 0) {
+        throw new Error(
+          `Feishu wiki node lookup for ${token} failed ` +
+            `(code ${res.code}: ${res.msg ?? ''})`,
+        )
       }
+      const node = res.data?.node
+      if (node?.obj_token === undefined || node.obj_token === '') return null
+      return { objToken: node.obj_token, objType: node.obj_type }
     },
 
     async fetchMessageResource(

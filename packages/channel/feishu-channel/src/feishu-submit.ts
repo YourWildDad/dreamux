@@ -30,14 +30,59 @@ import type { FeishuTarget } from './routing/target.js';
 export const CHANNEL_REMINDER =
   'The user in this chat sees only what you send through the reply tool; your assistant text is not shown to them.';
 
-export interface FeishuSubmission {
+/**
+ * The standing note for a turn a document comment woke.
+ *
+ * The chat reminder would be false here: the `reply` tool has no target in a
+ * document, and no tool on this Channel writes a comment. That consequence is
+ * the whole of it. Everything else about the comment is already on the
+ * envelope Core renders, and what to do with it is the receiving agent's
+ * decision, not a procedure this Channel teaches.
+ */
+export const DOC_COMMENT_REMINDER =
+  'This turn came from a comment on a Feishu document, not from a chat. ' +
+  'The reply tool does not reach that document; lark-cli reads and writes document comments.';
+
+/**
+ * The same note for a comment no subscription claims.
+ *
+ * It adds the one fact a cold open has and a subscribed delivery does not:
+ * nothing here follows this document, so the recipient has no standing reason
+ * to be reading it and the mention is the whole of why it was delivered here.
+ * The sentence is only true on the path that checks `mentionedBot`, which is
+ * the only path that carries it.
+ */
+export const DOC_COMMENT_COLD_OPEN_REMINDER =
+  `${DOC_COMMENT_REMINDER} ` +
+  'No recipient is subscribed to this document; it reached you because the comment @-mentioned this bot.';
+
+interface FeishuSubmissionBase {
   readonly attrs: Readonly<Record<string, string>>;
   readonly text: string;
   readonly reminder: string;
-  /** The Feishu message id: the identity Core deduplicates a repeat on. */
+  /** The identity Core deduplicates a repeat on. */
   readonly sourceId: string;
-  readonly anchor: VisibleMessageAnchor;
 }
+
+/**
+ * One submission, in one of the two shapes this Channel can produce.
+ *
+ * It is a union rather than one shape with a nullable anchor because the anchor
+ * is not optional information — it is what separates a turn the operator can
+ * already see in a chat from one that happened in a document. A nullable field
+ * would let a later caller forget the branch and open a chain-of-thought card
+ * with nowhere to hang it; a union does not compile.
+ */
+export type FeishuSubmission =
+  | (FeishuSubmissionBase & {
+      readonly kind: 'chat';
+      /** The visible Feishu message this turn's presentation hangs under. */
+      readonly anchor: VisibleMessageAnchor;
+    })
+  | (FeishuSubmissionBase & { readonly kind: 'doc_comment' });
+
+/** A submission that came from a chat, and therefore carries a visible anchor. */
+export type FeishuChatSubmission = Extract<FeishuSubmission, { kind: 'chat' }>;
 
 export type FeishuSubmitOutcome =
   | { readonly status: 'submitted'; readonly turnId: string | null }
@@ -136,6 +181,6 @@ export interface FeishuInboundDelivery {
   deliver(input: {
     target: FeishuTarget;
     containerChatId: string | null;
-    submission: FeishuSubmission;
+    submission: FeishuChatSubmission;
   }): Promise<FeishuSubmitOutcome>;
 }
