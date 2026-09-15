@@ -21,7 +21,7 @@ can survive context compression or transfer to another TeamLeader.
 
 At every stage, if code or knowledge-base facts expose ambiguity, an inaccurate
 description, or a possible scope wider than the operator has stated, use
-`ask_human_question` to confirm and clarify **one issue at a time**. This duty also
+`ask_user_question` to confirm and clarify **one issue at a time**. This duty also
 applies to behavior the operator has not mentioned. Evidence reveals a question;
 it does not authorize the TeamLeader to choose or extend the requirement.
 
