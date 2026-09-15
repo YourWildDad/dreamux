@@ -158,9 +158,10 @@ export class FeishuRouting {
    *
    * The previous team is read inside the change rather than before it, because
    * the change is what the commit serializes: reading first would answer from
-   * a document another commit may already have replaced. `requireOwner` is
-   * checked in the same place and for the same reason — a precondition read
-   * outside the commit is a precondition about a document that has moved on.
+   * a document another commit may already have replaced. `requireOwner` and
+   * the Collaboration Space refusal are checked in the same place and for the
+   * same reason — a precondition read outside the commit is a precondition
+   * about a document that has moved on.
    */
   async bind(input: {
     target: FeishuTarget;
@@ -179,6 +180,22 @@ export class FeishuRouting {
     await this.opts.store.update((document) => {
       const key = targetKey(input.target);
       const now = Date.now();
+      if (
+        input.target.kind === 'group' &&
+        document.spaces.some(
+          (row) => row.container_chat_id === input.target.chatId,
+        )
+      ) {
+        // The binding side of the document invariant stated on
+        // `FeishuRoutingDocument`. A topic inside the Space is unaffected and
+        // stays bindable — that is the row provisioning itself installs.
+        throw new PublicInvokeFailure(
+          'This Feishu chat is a Collaboration Space, which gives each of ' +
+            'its topics its own Team. Binding the chat itself would take ' +
+            'over every topic in it and stop new ones from getting a Team. ' +
+            'Bind a chat that is not a Collaboration Space.',
+        );
+      }
       const existing = document.bindings.find(
         (row) => targetKey(fromRecord(row.target)) === key,
       );
@@ -332,6 +349,23 @@ export class FeishuRouting {
           `Collaboration space ${JSON.stringify(input.spaceName)} is ` +
             'already bound to another Feishu chat. Choose another name, or ' +
             'unbind that space first.',
+        );
+      }
+      // The space side of the document invariant stated on
+      // `FeishuRoutingDocument`. Only a whole-chat row conflicts; the topic
+      // rows a Space installs as it provisions do not, so re-registering a
+      // Space that already has live topics keeps working.
+      const wholeChat = document.bindings.find(
+        (row) =>
+          row.target.kind === 'group' &&
+          row.target.chat_id === input.containerChatId,
+      );
+      if (wholeChat !== undefined) {
+        throw new PublicInvokeFailure(
+          `This Feishu chat is bound as a whole to Team ` +
+            `${JSON.stringify(wholeChat.team_name)}, which would answer for ` +
+            'every topic in it and leave new topics without a Team of their ' +
+            'own. Unbind the chat first, then register the space.',
         );
       }
       if (existing === undefined) {

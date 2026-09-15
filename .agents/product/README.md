@@ -88,15 +88,17 @@ the same change that touches it.
   (Domain: [channel](/.agents/domains/channel.md).)
 - **A message that starts with a known slash command is executed, not
   delivered.** In the built-in Feishu channel a human message whose leading
-  text is `/stop`, `/teams`, or `/dissolve` is carried out by the Channel
-  itself and answered as a receipt: no agent sees it, and no agent is asked to
-  render the reply. Only the leading token counts — trailing words after it are
-  ignored, and the same token mid-message is ordinary text — and in a group the
-  bot must be @-mentioned. Nothing gates a command beyond the ordinary
-  authorization to deliver a message here; there is no separate command
-  permission. When there is no object to act on, the answer is one line saying
-  why. `/stop` interrupts the agent this conversation talks to directly — the
-  bound Team's TeamLeader, or the Dispatcher Agent in a DM — and never its
+  text is `/bind`, `/dissolve`, `/help`, `/stop`, or `/teams` is carried out by
+  the Channel itself and answered as a receipt: no agent sees it, and no agent
+  is asked to render the reply. Only the leading token selects the command —
+  the same token mid-message is ordinary text — and in a group the bot must be
+  @-mentioned. What follows the token is the command's argument; a command that
+  takes none ignores it, so trailing words after `/stop` still change nothing.
+  Nothing gates a command beyond the ordinary authorization to deliver a message
+  here; there is no separate command permission. When there is no object to act
+  on, the answer is one line saying why. `/stop` interrupts the agent this
+  conversation talks to directly — the bound Team's TeamLeader, or the
+  Dispatcher Agent in a DM — and never its
   TeamMates. It reaches whatever that agent is doing, including work it started
   for itself rather than in answer to a message here. An agent that is not
   running is reported idle rather than started in order to be interrupted. `/teams` posts a card of
@@ -109,6 +111,40 @@ the same change that touches it.
   announces itself there. A refusal, and a conversation with no bound Team,
   still answer in words.
   (Task: [add-feishu-slash-commands](/.agents/tasks/channel/add-feishu-slash-commands/README.md).)
+- **`/bind <team_name>` routes the whole group from inside the conversation.**
+  An operator can point a Feishu group at a Team by typing, without asking an
+  agent to call a tool. It always binds the whole chat, so typing it inside a
+  topic routes the group rather than that topic. A chat already answered by
+  another Team is rebound without ceremony, and the Team that lost it is named
+  on the card. A direct message is refused, a missing or closed Team is refused,
+  and a refused bind changes no routing. A successful bind has no receipt of its own: the binding
+  card is the answer, and it is delivered into the conversation the command was
+  typed in rather than into the chat it bound — so an operator who typed it in
+  a topic hears back in that topic. Naming no Team answers with the command's
+  usage.
+  (Task: [add-bind-and-help-slash-commands](/.agents/tasks/channel/add-bind-and-help-slash-commands/README.md).)
+- **A chat is either bound to one Team or run as a collaboration space, never
+  both.** Routing a Space's own chat to a single Team would quietly take over
+  every topic in it and stop new topics from getting a Team of their own, with
+  nothing said. Both ways of reaching that state are refused and change nothing:
+  binding the chat of an existing Space — typed as `/bind`, or asked for by an
+  agent through `bind_channel` — and registering a Space on a chat that is
+  already bound, which says which Team holds it so the operator knows what to
+  release first. Binding a single topic is untouched, which is what the Space
+  itself does when it provisions one, so a Space with topics already running can
+  still be reconfigured.
+  (Task: [add-bind-and-help-slash-commands](/.agents/tasks/channel/add-bind-and-help-slash-commands/README.md).)
+- **A rebind names the Team it displaced.** The card announcing a binding shows
+  a `Previous Team` line whenever the conversation was answered by a different
+  Team before. It appears on every path that binds, including the MCP tool, and
+  is absent on a first bind and on rebinding a chat to the Team that already
+  holds it, where nothing was displaced.
+  (Task: [add-bind-and-help-slash-commands](/.agents/tasks/channel/add-bind-and-help-slash-commands/README.md).)
+- **`/help` lists the commands.** It answers with every command the Channel
+  knows, each with its usage and a one-line summary, in English. The list is
+  the command table itself, so a command the Channel can run is a command
+  `/help` names.
+  (Task: [add-bind-and-help-slash-commands](/.agents/tasks/channel/add-bind-and-help-slash-commands/README.md).)
 - **An interrupted turn says so on its card.** When a turn is interrupted, the
   card gains the line `[Request interrupted by user]` where the agent's next
   words would have gone, and the card's status reads 任务中断 rather than
