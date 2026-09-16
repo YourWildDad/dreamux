@@ -30,13 +30,27 @@ import {
 import { FeishuRouting } from '../src/routing/index.js';
 import { FeishuRoutingStore } from '../src/routing/store.js';
 
-const silentLogger = {
-  error: () => undefined,
-  warn: () => undefined,
-  info: () => undefined,
-  debug: () => undefined,
-  trace: () => undefined,
-};
+/** One log line, as the level it was written at and what it said. */
+type LoggedLine = { level: string; fields: Record<string, unknown>; message: string };
+
+function recordingLogger(lines: LoggedLine[]) {
+  const at = (level: string) =>
+    (fields: unknown, message?: unknown): undefined => {
+      lines.push({
+        level,
+        fields: (fields ?? {}) as Record<string, unknown>,
+        message: String(message ?? ''),
+      });
+      return undefined;
+    };
+  return {
+    error: at('error'),
+    warn: at('warn'),
+    info: at('info'),
+    debug: at('debug'),
+    trace: at('trace'),
+  };
+}
 
 let dir: string;
 
@@ -62,6 +76,8 @@ interface Harness {
   readonly commentReads: string[];
   /** What that read answers with; `null` is "Feishu holds no text for it". */
   readonly comment: { value: FeishuDocCommentText | Error | null };
+  /** Every line this delivery logged, in order. */
+  readonly logged: LoggedLine[];
 }
 
 async function harness(
@@ -84,10 +100,11 @@ async function harness(
   const trusted = new Set<string>();
   const commentReads: string[] = [];
   const comment: Harness['comment'] = { value: null };
+  const logged: LoggedLine[] = [];
   const comments = new FeishuDocumentComments({
     dispatcherId: 'disp-1',
     channelId: 'chan-1',
-    log: silentLogger,
+    log: recordingLogger(logged),
     routing,
     async submit(teamName, submission) {
       submissions.push({ teamName, submission });
@@ -125,6 +142,7 @@ async function harness(
     trusted,
     commentReads,
     comment,
+    logged,
   };
 }
 
@@ -354,6 +372,98 @@ describe('document comment delivery', () => {
     ]);
   });
 
+  it('a failed submission is logged as a failure, not as a delivery', async () => {
+    const h = await harness();
+    await h.comments.subscribe({
+      document: 'doc_tok',
+      type: 'docx',
+      teamName: 'team-a',
+    });
+    // What a submission after the session's fence closed answers with.
+    h.outcomeFor.set('team-a', {
+      status: 'error',
+      message: 'Feishu session is not live',
+    });
+
+    await h.comments.deliver(commentEvent());
+
+    // The delivery report is the last thing each path logs.
+    const line = h.logged.at(-1);
+    expect(line?.level).toBe('error');
+    expect(line?.message).toBe('failed to deliver a feishu document comment');
+    expect(line?.fields['err']).toEqual({ message: 'Feishu session is not live' });
+    expect(line?.fields['team_name']).toBe('team-a');
+  });
+
+  it('an ambiguous admission is not reported as a failed delivery', async () => {
+    const h = await harness();
+    await h.comments.subscribe({
+      document: 'doc_tok',
+      type: 'docx',
+      teamName: 'team-a',
+    });
+    // Core may already have opened a turn for this comment. Calling that a
+    // failed delivery is exactly as false as calling it a delivered one.
+    h.outcomeFor.set('team-a', { status: 'ambiguous', error: null });
+
+    await h.comments.deliver(commentEvent());
+
+    // The delivery report is the last thing each path logs.
+    const line = h.logged.at(-1);
+    expect(line?.level).toBe('error');
+    expect(line?.message).toBe(
+      'feishu document comment admission was ambiguous; not replaying',
+    );
+  });
+
+  it('a comment Core declines to admit is logged as not admitted', async () => {
+    const h = await harness();
+    await h.comments.subscribe({
+      document: 'doc_tok',
+      type: 'docx',
+      teamName: 'team-a',
+    });
+    h.outcomeFor.set('team-a', { status: 'duplicate' });
+
+    await h.comments.deliver(commentEvent());
+
+    // The delivery report is the last thing each path logs.
+    const line = h.logged.at(-1);
+    expect(line?.level).toBe('info');
+    expect(line?.message).toBe('feishu document comment was not admitted');
+  });
+
+  it('a delivered comment carries the turn it opened', async () => {
+    const h = await harness();
+    await h.comments.subscribe({
+      document: 'doc_tok',
+      type: 'docx',
+      teamName: 'team-a',
+    });
+
+    await h.comments.deliver(commentEvent());
+
+    // The delivery report is the last thing each path logs.
+    const line = h.logged.at(-1);
+    expect(line?.level).toBe('info');
+    expect(line?.message).toBe('feishu document comment delivered');
+    expect(line?.fields['turn_id']).toBe('t-1');
+  });
+
+  it('a cold open to the Dispatcher Agent reports under a null team', async () => {
+    const h = await harness();
+    h.trusted.add('ou_commenter');
+    h.outcomeFor.set(null, { status: 'error', message: 'core said no' });
+
+    await h.comments.deliver(commentEvent({ mentionedBot: true }));
+
+    // The delivery report is the last thing each path logs.
+    const line = h.logged.at(-1);
+    expect(line?.level).toBe('error');
+    expect(line?.message).toBe('failed to deliver a feishu document comment');
+    expect(line?.fields['team_name']).toBeNull();
+  });
+
   it('a rejected subscriber loses its own row while the other still receives its submission', async () => {
     const h = await harness();
     await h.comments.subscribe({
@@ -453,7 +563,7 @@ describe('document comment delivery', () => {
     expect(h.submissions[0]!.submission.attrs['notice_type']).toBe('add_comment');
   });
 
-  it('carries what the commenter wrote, and the document text it is anchored to', async () => {
+  it('carries what the commenter wrote, and a preview of what it is anchored to', async () => {
     const h = await harness();
     await h.comments.subscribe({
       document: 'doc_tok',
@@ -461,7 +571,12 @@ describe('document comment delivery', () => {
       teamName: 'team-a',
     });
     h.comment.value = {
-      quote: 'the paragraph in question',
+      anchor: {
+        kind: 'content',
+        anchorId: 'blk_1',
+        preview: 'the paragraph in question',
+        deleted: false,
+      },
       segments: [
         { kind: 'mention', openId: 'ou_bot' },
         { kind: 'text', text: ' please rework this' },
@@ -471,17 +586,24 @@ describe('document comment delivery', () => {
     await h.comments.deliver(commentEvent({ replyId: 'rpl_1' }));
 
     expect(h.commentReads).toEqual(['doc_tok:cmt_1:rpl_1']);
+    // The note says the block is a preview, because it is: Feishu shortens it
+    // and says neither that it did nor by how much.
     expect(h.submissions[0]!.submission.text).toBe(
-      '<quote note="the document text this comment is anchored to">\n' +
+      '<quote note="a preview of the anchored content, as Feishu shortens it; ' +
+        'anchor_id on this envelope names the content itself">\n' +
         'the paragraph in question\n' +
         '</quote>\n' +
         '<content>\n' +
         '<at user_id="ou_bot"></at> please rework this\n' +
         '</content>',
     );
+    const { attrs } = h.submissions[0]!.submission;
+    expect(attrs['anchor']).toBe('content');
+    expect(attrs['anchor_id']).toBe('blk_1');
+    expect(attrs).not.toHaveProperty('anchor_deleted');
   });
 
-  it('a whole-document comment carries no quote block', async () => {
+  it('says the anchored content is gone when Feishu says so', async () => {
     const h = await harness();
     await h.comments.subscribe({
       document: 'doc_tok',
@@ -489,15 +611,39 @@ describe('document comment delivery', () => {
       teamName: 'team-a',
     });
     h.comment.value = {
-      quote: '',
+      anchor: {
+        kind: 'content',
+        anchorId: 'blk_1',
+        preview: 'the paragraph in question',
+        deleted: true,
+      },
+      segments: [{ kind: 'text', text: 'please rework this' }],
+    };
+
+    await h.comments.deliver(commentEvent());
+
+    expect(h.submissions[0]!.submission.attrs['anchor_deleted']).toBe('true');
+  });
+
+  it('a whole-document comment carries no quote block, and says it is whole', async () => {
+    const h = await harness();
+    await h.comments.subscribe({
+      document: 'doc_tok',
+      type: 'docx',
+      teamName: 'team-a',
+    });
+    h.comment.value = {
+      anchor: { kind: 'whole_document' },
       segments: [{ kind: 'text', text: 'looks good' }],
     };
 
     await h.comments.deliver(commentEvent());
 
-    const { text } = h.submissions[0]!.submission;
+    const { text, attrs } = h.submissions[0]!.submission;
     expect(text).not.toContain('<quote');
     expect(text).toContain('<content>\nlooks good\n</content>');
+    expect(attrs['anchor']).toBe('whole_document');
+    expect(attrs).not.toHaveProperty('anchor_id');
   });
 
   it('escapes the comment text exactly as a chat body is escaped', async () => {
@@ -508,7 +654,12 @@ describe('document comment delivery', () => {
       teamName: 'team-a',
     });
     h.comment.value = {
-      quote: 'a & b',
+      anchor: {
+        kind: 'content',
+        anchorId: 'blk_1',
+        preview: 'a & b',
+        deleted: false,
+      },
       segments: [{ kind: 'text', text: 'use <at> & not <b>' }],
     };
 
@@ -535,6 +686,9 @@ describe('document comment delivery', () => {
     // Feishu answered nothing for would become a failed delivery instead.
     expect(h.submissions[0]!.submission.text).toBe('<content />');
     expect(h.submissions[0]!.submission.attrs['comment_id']).toBe('cmt_1');
+    // An unread comment states no anchor. That is what keeps it distinct from
+    // a comment the commenter deliberately put on the whole document.
+    expect(h.submissions[0]!.submission.attrs).not.toHaveProperty('anchor');
   });
 
   it('reads the text once for an event with several subscribers', async () => {
@@ -569,7 +723,7 @@ describe('document comment delivery', () => {
     const h = await harness();
     h.trusted.add('ou_commenter');
     h.comment.value = {
-      quote: '',
+      anchor: { kind: 'whole_document' },
       segments: [{ kind: 'text', text: 'who owns this?' }],
     };
 

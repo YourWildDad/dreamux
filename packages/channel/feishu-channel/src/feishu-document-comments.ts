@@ -59,9 +59,11 @@ import {
 import {
   DOC_COMMENT_COLD_OPEN_REMINDER,
   DOC_COMMENT_REMINDER,
+  describeSubmitOutcome,
   errorMessage,
   type FeishuSubmission,
   type FeishuSubmitOutcome,
+  type SubmitOutcomeMessages,
 } from './feishu-submit.js';
 import type { FeishuRouting } from './routing/index.js';
 import type { FeishuDocSubscriptionRecord } from './routing/document.js';
@@ -75,7 +77,15 @@ import type { FeishuDocSubscriptionRecord } from './routing/document.js';
  */
 const ENRICHMENT_TIMEOUT_MS = 2_000;
 
-const DOC_COMMENT_QUOTE_NOTE = 'the document text this comment is anchored to';
+/**
+ * What `<quote>` is, said in the one place a reader meets it. Without this the
+ * block reads as the anchored passage itself, which it is not: Feishu derives
+ * it and cuts it at a length of its own, and the envelope's `anchor_id` is what
+ * names the content the passage came from.
+ */
+const DOC_COMMENT_QUOTE_NOTE =
+  'a preview of the anchored content, as Feishu shortens it; ' +
+  'anchor_id on this envelope names the content itself';
 
 export interface FeishuDocumentCommentsOptions {
   readonly dispatcherId: string;
@@ -295,10 +305,7 @@ export class FeishuDocumentComments {
     // No row is written and none is removed: this delivery is a cold open, not
     // a subscription, so a rejection on it has nothing to reconcile.
     const outcome = await this.opts.submit(null, submission);
-    this.opts.log.info(
-      { ...this.scope(event), status: outcome.status },
-      'delivered an unfollowed Feishu document mention to the Dispatcher Agent',
-    );
+    this.reportDelivery({ ...this.scope(event), team_name: null }, outcome);
   }
 
   private async deliverTo(
@@ -309,10 +316,7 @@ export class FeishuDocumentComments {
     const scope = { ...this.scope(event), team_name: row.team_name };
     const outcome = await this.opts.submit(row.team_name, submission);
     if (outcome.status !== 'rejected') {
-      this.opts.log.info(
-        { ...scope, status: outcome.status },
-        'feishu document comment delivered',
-      );
+      this.reportDelivery(scope, outcome);
       return;
     }
     // The same proof that retires a stale binding: Core resolved the recipient
@@ -337,6 +341,27 @@ export class FeishuDocumentComments {
         'could not commit the removal of a Feishu document subscription',
       );
     }
+  }
+
+  /**
+   * Say what became of one delivery, in this path's words.
+   *
+   * It said "delivered" for every outcome but a proven rejection, which hid
+   * the two this path can actually take: a submission refused because the
+   * session's fence had already closed, and a body Core would not admit.
+   *
+   * The recipient is in the scope rather than the message: `team_name` is the
+   * subscriber's, or `null` for the cold open the Dispatcher Agent answers.
+   */
+  private reportDelivery(
+    scope: Record<string, unknown>,
+    outcome: FeishuSubmitOutcome,
+  ): void {
+    const report = describeSubmitOutcome(outcome);
+    this.opts.log[report.level](
+      { ...scope, ...report.fields },
+      DOC_COMMENT_DELIVERY_MESSAGES[report.kind],
+    );
   }
 
   private scope(event: FeishuCommentEvent): Record<string, unknown> {
@@ -404,6 +429,20 @@ export class FeishuDocumentComments {
 }
 
 /**
+ * The document path's words for each outcome.
+ *
+ * `rejected` belongs to the cold open alone: a subscriber's rejection is
+ * answered above by retiring its row, and never reaches here.
+ */
+const DOC_COMMENT_DELIVERY_MESSAGES: SubmitOutcomeMessages = {
+  submitted: 'feishu document comment delivered',
+  not_admitted: 'feishu document comment was not admitted',
+  rejected: 'feishu document comment was rejected before admission',
+  ambiguous: 'feishu document comment admission was ambiguous; not replaying',
+  failed: 'failed to deliver a feishu document comment',
+};
+
+/**
  * The one submission a comment event produces, shared by every subscriber.
  *
  * `sourceId` carries the reply id as well as the comment id, and that is
@@ -427,7 +466,7 @@ function documentCommentSubmission(input: {
   const { event } = input;
   return {
     kind: 'doc_comment',
-    attrs: documentCommentAttrs(event, input.senderName),
+    attrs: documentCommentAttrs(event, input.senderName, input.comment),
     text: documentCommentBody(input.comment),
     reminder: input.reminder,
     sourceId: `${event.fileToken}:${event.commentId}:${event.replyId}`,
@@ -451,11 +490,22 @@ function documentCommentSubmission(input: {
  * `mentioned` stays even though a mention now shows in the body: the model does
  * not know its own open_id, so it cannot derive the platform's own verdict on
  * whether this bot was addressed.
+ *
+ * `anchor` says what the comment is about, and carrying it is the reason an
+ * unread comment is no longer indistinguishable from a comment on the whole
+ * document: the attribute is absent exactly when the comment could not be read.
+ * `anchor_id` names the content for a reader that wants it in full — the
+ * channel does not fetch it, because one anchored part can be far larger than
+ * every comment on it. `anchor_deleted` appears only when Feishu says the
+ * content is gone; a response that does not raise it is not a denial, so
+ * nothing is written for one.
  */
 function documentCommentAttrs(
   event: FeishuCommentEvent,
   senderName: string,
+  comment: FeishuDocCommentText | null,
 ): Record<string, string> {
+  const anchor = comment?.anchor;
   const pairs: Array<[string, string]> = [
     ['source', 'feishu'],
     ['file_token', event.fileToken],
@@ -463,6 +513,9 @@ function documentCommentAttrs(
     ['comment_id', event.commentId],
     ['reply_id', event.replyId],
     ['notice_type', event.replyId === '' ? 'add_comment' : 'add_reply'],
+    ['anchor', anchor === undefined ? '' : anchor.kind],
+    ['anchor_id', anchor?.kind === 'content' ? anchor.anchorId : ''],
+    ['anchor_deleted', anchor?.kind === 'content' && anchor.deleted ? 'true' : ''],
     ['mentioned', event.mentionedBot ? 'true' : 'false'],
     ['sender_id', event.commenterId],
     ['sender_name', senderName],
@@ -482,17 +535,19 @@ function documentCommentAttrs(
  * path exists to avoid. An empty `<content />` here means Feishu did not answer
  * with the comment's text, and the envelope's ids still address it.
  *
- * `<quote>` carries the document text the comment is anchored to, and only
- * appears when there is one — a comment on the whole document has none. Its
- * note is the one thing nothing else says: without it `quote` reads just as
- * easily as text quoted from an earlier reply.
+ * `<quote>` appears only for a comment anchored to content Feishu previewed:
+ * one on the whole document has no preview to show, and neither has one whose
+ * anchor Feishu returned without any text. Its note is the one thing nothing
+ * else says — without it the block reads as the anchored passage, or as text
+ * quoted from an earlier reply.
  */
 function documentCommentBody(comment: FeishuDocCommentText | null): string {
   const blocks: string[] = [];
-  if (comment !== null && comment.quote !== '') {
+  const anchor = comment?.anchor;
+  if (anchor?.kind === 'content' && anchor.preview !== '') {
     blocks.push(
       `<quote note="${escapeXmlAttribute(DOC_COMMENT_QUOTE_NOTE)}">\n` +
-        `${escapeXmlText(comment.quote)}\n</quote>`,
+        `${escapeXmlText(anchor.preview)}\n</quote>`,
     );
   }
   const content = comment === null ? '' : renderCommentSegments(comment.segments);
